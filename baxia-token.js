@@ -9,6 +9,155 @@ const { v4: uuidv4 } = require('uuid');
 // 缓存
 let browserInstance = null;
 let pageInstance = null;
+
+// Baxia Token 缓存
+let baxiaTokenCache = {
+  bxUa: null,
+  bxUmidToken: null,
+  bxV: '2.5.36',
+  expiresAt: 0
+};
+
+/**
+ * 获取 Baxia 安全 token (bx-ua, bx-umidtoken, bx-v)
+ * 这些 token 用于阿里云安全验证
+ * 
+ * @param {Object} options - 选项
+ * @param {boolean} options.skipCache - 是否跳过缓存，强制获取新 token
+ * @param {boolean} options.freshContext - 是否使用新的浏览器上下文（让 bx-ua 变化）
+ * @returns {Object} { bxUa, bxUmidToken, bxV }
+ */
+async function getBaxiaTokens(options = {}) {
+  const { skipCache = false, freshContext = true } = options;
+  const now = Date.now();
+  
+  // 缓存 5 分钟有效（除非跳过缓存）
+  if (!skipCache && baxiaTokenCache.bxUa && baxiaTokenCache.expiresAt > now) {
+    return {
+      bxUa: baxiaTokenCache.bxUa,
+      bxUmidToken: baxiaTokenCache.bxUmidToken,
+      bxV: baxiaTokenCache.bxV
+    };
+  }
+  
+  console.log('[Baxia] Fetching new tokens...');
+  
+  const browser = await getBrowser();
+  
+  // 使用新的浏览器上下文（incognito）来生成不同的指纹
+  let context;
+  if (freshContext) {
+    // Puppeteer 新版本使用 createBrowserContext
+    context = typeof browser.createBrowserContext === 'function' 
+      ? await browser.createBrowserContext()
+      : browser;
+  } else {
+    context = browser;
+  }
+  const page = await context.newPage();
+  
+  try {
+    // 设置 User-Agent
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36');
+    
+    // 拦截请求，捕获 wu.json 的响应
+    let umidToken = null;
+    await page.setRequestInterception(true);
+    
+    page.on('response', async (response) => {
+      if (response.url().includes('wu.json')) {
+        const etag = response.headers()['etag'];
+        if (etag) {
+          umidToken = etag;
+          console.log('[Baxia] Captured umidToken from ETag:', etag.substring(0, 20) + '...');
+        }
+      }
+    });
+    
+    page.on('request', (request) => {
+      request.continue();
+    });
+    
+    // 访问 Qwen Chat 页面
+    console.log('[Baxia] Navigating to chat.qwen.ai...');
+    await page.goto('https://chat.qwen.ai', {
+      waitUntil: 'networkidle2',
+      timeout: 30000,
+    });
+    
+    // 等待 Baxia SDK 加载完成
+    await page.waitForFunction(() => {
+      return window.baxiaCommon && typeof window.baxiaCommon.getUA === 'function';
+    }, { timeout: 10000 });
+    
+    // 额外等待确保 umidToken 已获取
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    
+    // 在页面中获取 token
+    const tokens = await page.evaluate(() => {
+      const result = {
+        bxUa: null,
+        bxUmidToken: null,
+        bxV: null,
+        baxiaVersion: null,
+        options: null
+      };
+      
+      // 获取 bx-ua
+      if (window.baxiaCommon && typeof window.baxiaCommon.getUA === 'function') {
+        try {
+          result.bxUa = window.baxiaCommon.getUA();
+          result.bxV = window.baxiaCommon.version || '2.5.36';
+        } catch (e) {
+          console.error('Failed to get UA:', e);
+        }
+      }
+      
+      // 获取配置信息
+      if (window.__baxia__ && window.__baxia__.options) {
+        result.options = window.__baxia__.options;
+      }
+      
+      return result;
+    });
+    
+    // 使用拦截到的 umidToken 或尝试从页面获取
+    tokens.bxUmidToken = umidToken;
+    
+    if (!tokens.bxUa) {
+      throw new Error('Failed to get bx-ua token');
+    }
+    
+    // 更新缓存
+    baxiaTokenCache = {
+      bxUa: tokens.bxUa,
+      bxUmidToken: tokens.bxUmidToken,
+      bxV: tokens.bxV || '2.5.36',
+      expiresAt: now + 5 * 60 * 1000 // 5 分钟缓存
+    };
+    
+    console.log('[Baxia] Tokens obtained successfully');
+    console.log('[Baxia] bx-ua length:', tokens.bxUa.length);
+    console.log('[Baxia] bx-umidtoken:', tokens.bxUmidToken ? tokens.bxUmidToken.substring(0, 20) + '...' : 'null');
+    console.log('[Baxia] bx-v:', tokens.bxV);
+    
+    return {
+      bxUa: tokens.bxUa,
+      bxUmidToken: tokens.bxUmidToken,
+      bxV: tokens.bxV || '2.5.36'
+    };
+    
+  } catch (error) {
+    console.error('[Baxia] Error fetching tokens:', error.message);
+    throw error;
+  } finally {
+    await page.close();
+    // 关闭 incognito context 以确保下次生成不同的指纹
+    if (freshContext && context !== browser) {
+      await context.close();
+    }
+  }
+}
 let currentChatId = null;  // 当前活跃的聊天会话 ID
 let lastChatModel = null;  // 上一次使用的模型
 
@@ -398,4 +547,27 @@ module.exports = {
   getAuthenticatedPage,
   convertToOpenAIFormat,
   buildQwenMessage,
+  getBaxiaTokens,
 };
+
+// 直接运行时获取 tokens
+if (require.main === module) {
+  (async () => {
+    try {
+      console.log('Fetching Baxia tokens...\n');
+      // skipCache: 跳过缓存
+      // freshContext: 使用新的浏览器上下文，让 bx-ua 每次都不同
+      const tokens = await getBaxiaTokens({ skipCache: true, freshContext: true });
+      console.log('bx-ua:', tokens.bxUa.substring(0, 50) + '...');
+      console.log('bx-umidtoken:', tokens.bxUmidToken);
+      console.log('bx-v:', tokens.bxV);
+      console.log('\nFull JSON:');
+      console.log(JSON.stringify(tokens, null, 2));
+    } catch (error) {
+      console.error('Error:', error.message);
+      process.exit(1);
+    } finally {
+      await closeBrowser();
+    }
+  })();
+}
