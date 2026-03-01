@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "functions": {
+    "api/**/*.js": {
+      "runtime": "@vercel/node@4"
+    }
+  },
+  "routes": [
+    { "src": "/v1/models", "dest": "/api/index.js" },
+    { "src": "/v1/chat/completions", "dest": "/api/index.js" },
+    { "src": "/(.*)", "dest": "/api/index.js" }
+  ]
+}

@@ -1,21 +1,20 @@
-/**
- * Qwen2API - 多平台兼容入口
- * 
- * 支持: Docker (Express) / Vercel / Netlify / Cloudflare Workers
- */
-
 const { v4: uuidv4 } = require('uuid');
-const { getBaxiaTokensUniversal } = require('./baxia-node');
+const { getBaxiaTokensUniversal } = require('../baxia-node');
 
 // API Token 配置 (从环境变量获取，多个 token 用逗号分隔)
 const API_TOKENS = (process.env.API_TOKENS || 'auto').split(',').filter(t => t.trim());
 
-// Token 验证 (OpenAI 兼容格式: Authorization: Bearer <token>)
+// Token 验证中间件 (OpenAI 兼容格式: Authorization: Bearer <token>)
 function validateToken(authHeader) {
-  if (API_TOKENS.length === 0) return true;
+  // 如果没有配置 token，跳过验证
+  if (API_TOKENS.length === 0) {
+    return true;
+  }
+  
   const token = authHeader && authHeader.startsWith('Bearer ') 
     ? authHeader.slice(7).trim() 
     : '';
+  
   return API_TOKENS.includes(token);
 }
 
@@ -34,11 +33,30 @@ function createResponse(body, status = 200, headers = {}) {
   };
 }
 
+// 创建流式响应 (用于 Vercel/Netlify)
+function createStreamResponse(stream, headers = {}) {
+  return {
+    statusCode: 200,
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': '*',
+      ...headers,
+    },
+    body: stream,
+  };
+}
+
 // OpenAI 格式的模型列表 API
 async function handleModels(authHeader) {
   if (!validateToken(authHeader)) {
     return createResponse({
-      error: { message: 'Incorrect API key provided.', type: 'invalid_request_error', code: 'invalid_api_key' }
+      error: {
+        message: 'Incorrect API key provided.',
+        type: 'invalid_request_error',
+        code: 'invalid_api_key'
+      }
     }, 401);
   }
 
@@ -51,20 +69,29 @@ async function handleModels(authHeader) {
       },
     });
 
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
     const data = await response.json();
     return createResponse(data);
   } catch (error) {
     console.error('Error fetching models:', error);
-    return createResponse({ error: { message: 'Failed to fetch models', type: 'api_error' } }, 500);
+    return createResponse({ 
+      error: { message: 'Failed to fetch models', type: 'api_error' }
+    }, 500);
   }
 }
 
 // OpenAI 格式的聊天完成 API
-async function handleChatCompletions(body, authHeader, streamHandler = null) {
+async function handleChatCompletions(body, authHeader) {
   if (!validateToken(authHeader)) {
     return createResponse({
-      error: { message: 'Incorrect API key provided.', type: 'invalid_request_error', code: 'invalid_api_key' }
+      error: {
+        message: 'Incorrect API key provided.',
+        type: 'invalid_request_error',
+        code: 'invalid_api_key'
+      }
     }, 401);
   }
 
@@ -74,10 +101,14 @@ async function handleChatCompletions(body, authHeader, streamHandler = null) {
     const { model, messages, stream = true } = body;
 
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
-      return createResponse({ error: { message: 'Messages are required', type: 'invalid_request_error' } }, 400);
+      return createResponse({ 
+        error: { message: 'Messages are required', type: 'invalid_request_error' }
+      }, 400);
     }
 
     const actualModel = model || 'qwen3.5-plus';
+    
+    // 获取最后一条用户消息
     const lastUserMessage = messages.filter(m => m.role === 'user').pop();
     const userContent = lastUserMessage ? lastUserMessage.content : 'hello';
     
@@ -107,17 +138,19 @@ async function handleChatCompletions(body, authHeader, streamHandler = null) {
       'x-request-id': uuidv4(),
     };
     
-    const createResp = await fetch('https://chat.qwen.ai/api/v2/chats/new', {
+    const createResponse = await fetch('https://chat.qwen.ai/api/v2/chats/new', {
       method: 'POST',
       headers: createHeaders,
       body: JSON.stringify(createChatBody),
     });
     
-    const createData = await createResp.json();
+    const createData = await createResponse.json();
     console.log(`[Step 2] Create chat session: ${Date.now() - startTime}ms`);
     
     if (!createData.success || !createData.data?.id) {
-      return createResponse({ error: { message: 'Failed to create chat session', details: createData } }, 500);
+      return createResponse({ 
+        error: { message: 'Failed to create chat session', details: createData }
+      }, 500);
     }
     
     const chatId = createData.data.id;
@@ -166,7 +199,11 @@ async function handleChatCompletions(body, authHeader, streamHandler = null) {
           thinking_format: 'summary',
           auto_search: true,
         },
-        extra: { meta: { subChatType: 't2t' } },
+        extra: {
+          meta: {
+            subChatType: 't2t',
+          },
+        },
         sub_chat_type: 't2t',
         parent_id: null,
       }],
@@ -206,15 +243,12 @@ async function handleChatCompletions(body, authHeader, streamHandler = null) {
     if (!response.ok) {
       const errorText = await response.text();
       console.error('[API] Chat error:', response.status, errorText);
-      return createResponse({ error: { message: errorText, type: 'api_error' } }, response.status);
+      return createResponse({ 
+        error: { message: errorText, type: 'api_error' }
+      }, response.status);
     }
 
-    // 使用流处理器或默认处理
-    if (streamHandler) {
-      return streamHandler(response, actualModel, startTime);
-    }
-
-    // 默认处理：收集完整响应
+    // 对于 Serverless 环境，收集完整响应
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -228,6 +262,7 @@ async function handleChatCompletions(body, authHeader, streamHandler = null) {
         console.log(`[Done] Total time: ${Date.now() - startTime}ms`);
         break;
       }
+      
       buffer += decoder.decode(value, { stream: true });
     }
     
@@ -246,7 +281,7 @@ async function handleChatCompletions(body, authHeader, streamHandler = null) {
     }
 
     if (stream) {
-      // 返回模拟流式响应
+      // 返回模拟流式响应 (Serverless 环境通常不支持真正的流式)
       const streamBody = contentChunks.map((content, i) => {
         return `data: ${JSON.stringify({
           id: responseId,
@@ -261,7 +296,7 @@ async function handleChatCompletions(body, authHeader, streamHandler = null) {
         })}\n\n`;
       }).join('') + 'data: [DONE]\n\n';
       
-      return createResponse(streamBody, 200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
+      return createStreamResponse(streamBody);
     } else {
       // 非流式响应
       const openAI = {
@@ -271,35 +306,43 @@ async function handleChatCompletions(body, authHeader, streamHandler = null) {
         model: actualModel,
         choices: [{
           index: 0,
-          message: { role: 'assistant', content: contentChunks.join('') },
+          message: {
+            role: 'assistant',
+            content: contentChunks.join(''),
+          },
           finish_reason: 'stop',
         }],
         usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
       };
+      
       return createResponse(openAI);
     }
   } catch (error) {
     console.error('Error in chat completions:', error);
-    return createResponse({ error: { message: error.message, type: 'internal_error' } }, 500);
+    return createResponse({ 
+      error: { message: error.message, type: 'internal_error' }
+    }, 500);
   }
 }
 
-// ============================================
-// Serverless Handler (Vercel / Netlify)
-// ============================================
-async function serverlessHandler(req, res) {
+// 主处理函数 - Vercel/Netlify 格式
+module.exports = async function handler(req, res) {
   // 处理 CORS preflight
   if (req.method === 'OPTIONS') {
     return res ? res.status(200).end() : createResponse('', 200);
   }
   
   const authHeader = req.headers?.authorization || req.headers?.Authorization || '';
+  
+  // 路由处理
   const path = req.url || req.path || '';
   
   // 模型列表
   if (req.method === 'GET' && path.includes('/v1/models')) {
     const result = await handleModels(authHeader);
-    if (res) return res.status(result.statusCode).set(result.headers).send(result.body);
+    if (res) {
+      return res.status(result.statusCode).set(result.headers).send(result.body);
+    }
     return result;
   }
   
@@ -307,182 +350,30 @@ async function serverlessHandler(req, res) {
   if (req.method === 'POST' && path.includes('/v1/chat/completions')) {
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
     const result = await handleChatCompletions(body, authHeader);
-    if (res) return res.status(result.statusCode).set(result.headers).send(result.body);
+    if (res) {
+      return res.status(result.statusCode).set(result.headers).send(result.body);
+    }
     return result;
   }
   
   // 根路径
   if (req.method === 'GET' && (path === '/' || path.endsWith('/'))) {
     const html = '<html>\n<head><title>200 OK</title></head>\n<body>\n<center><h1>200 OK</h1></center>\n<hr><center>nginx</center>\n</body>\n</html>\n';
-    if (res) return res.status(200).send(html);
+    if (res) {
+      return res.status(200).send(html);
+    }
     return createResponse(html, 200, { 'Content-Type': 'text/html' });
   }
   
   // 404
   const notFound = { error: { message: 'Not found', type: 'not_found' } };
-  if (res) return res.status(404).json(notFound);
-  return createResponse(notFound, 404);
-}
-
-// ============================================
-// Express Server (Docker / 本地开发)
-// ============================================
-function startExpressServer() {
-  const express = require('express');
-  const app = express();
-  app.use(express.json());
-
-  // Token 验证中间件
-  function authMiddleware(req, res, next) {
-    if (API_TOKENS.length === 0) return next();
-    const authHeader = req.headers.authorization || '';
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-    if (!token || !API_TOKENS.includes(token)) {
-      return res.status(401).json({
-        error: { message: 'Incorrect API key provided.', type: 'invalid_request_error', code: 'invalid_api_key' }
-      });
-    }
-    next();
+  if (res) {
+    return res.status(404).json(notFound);
   }
+  return createResponse(notFound, 404);
+};
 
-  // 模型列表
-  app.get('/v1/models', authMiddleware, async (req, res) => {
-    const result = await handleModels(req.headers.authorization);
-    res.status(result.statusCode).set(result.headers).send(result.body);
-  });
-
-  // 聊天完成 (支持真正的流式)
-  app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
-    const { model, messages, stream = true } = req.body;
-    const actualModel = model || 'qwen3.5-plus';
-    const responseId = `chatcmpl-${uuidv4()}`;
-    const created = Math.floor(Date.now() / 1000);
-    
-    // 流式处理函数
-    const streamHandler = async (response, actualModel, startTime) => {
-      if (stream) {
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('Connection', 'keep-alive');
-        
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) {
-            console.log(`[Done] Total time: ${Date.now() - startTime}ms`);
-            break;
-          }
-          
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-          
-          for (const line of lines) {
-            if (!line.startsWith('data: ')) continue;
-            const data = line.slice(6).trim();
-            if (data === '[DONE]') {
-              res.write('data: [DONE]\n\n');
-              continue;
-            }
-            
-            try {
-              const parsed = JSON.parse(data);
-              const openAIChunk = {
-                id: responseId,
-                object: 'chat.completion.chunk',
-                created: created,
-                model: actualModel,
-                choices: [{ index: 0, delta: {}, finish_reason: null }],
-              };
-              
-              if (parsed.choices && parsed.choices[0]) {
-                if (parsed.choices[0].delta?.content) {
-                  openAIChunk.choices[0].delta = { content: parsed.choices[0].delta.content };
-                }
-                if (parsed.choices[0].finish_reason) {
-                  openAIChunk.choices[0].finish_reason = parsed.choices[0].finish_reason;
-                }
-              }
-              res.write(`data: ${JSON.stringify(openAIChunk)}\n\n`);
-            } catch (e) {}
-          }
-        }
-        res.write('data: [DONE]\n\n');
-        res.end();
-        return;
-      }
-      
-      // 非流式
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      let contentChunks = [];
-      
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-      }
-      
-      const lines = buffer.split('\n');
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const data = line.slice(6).trim();
-        if (data === '[DONE]') continue;
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed.choices && parsed.choices[0]?.delta?.content) {
-            contentChunks.push(parsed.choices[0].delta.content);
-          }
-        } catch (e) {}
-      }
-      
-      const openAI = {
-        id: responseId,
-        object: 'chat.completion',
-        created: created,
-        model: actualModel,
-        choices: [{ index: 0, message: { role: 'assistant', content: contentChunks.join('') }, finish_reason: 'stop' }],
-        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-      };
-      res.json(openAI);
-    };
-    
-    await handleChatCompletions(req.body, req.headers.authorization, streamHandler);
-  });
-
-  // 根路径
-  app.get('/', (req, res) => {
-    res.status(200).send('<html>\n<head><title>200 OK</title></head>\n<body>\n<center><h1>200 OK</h1></center>\n<hr><center>nginx</center>\n</body>\n</html>\n');
-  });
-
-  const PORT = process.env.PORT || 8765;
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Qwen2API server running on port ${PORT}`);
-  }).on('error', (err) => {
-    console.error('Server error:', err);
-  });
-}
-
-// ============================================
-// 导出 & 入口判断
-// ============================================
-
-// 导出 serverless handler
-module.exports = serverlessHandler;
+// 导出子路由处理函数
 module.exports.handleModels = handleModels;
 module.exports.handleChatCompletions = handleChatCompletions;
 module.exports.createResponse = createResponse;
-
-// 判断运行环境
-const isVercel = process.env.VERCEL === '1';
-const isNetlify = process.env.NETLIFY === 'true';
-const isServerless = isVercel || isNetlify;
-
-// 如果不是 serverless 环境，启动 Express 服务器
-if (!isServerless && require.main === module) {
-  startExpressServer();
-}

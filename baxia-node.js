@@ -2,6 +2,7 @@
  * 纯 Node.js 实现 Baxia Token 生成 (无需浏览器)
  * 
  * 已验证可正常工作于 Qwen API
+ * 兼容: Node.js / Cloudflare Workers / Vercel / Netlify
  * 
  * 原理：
  * - bx-umidtoken: 从 sg-wum.alibaba.com/w/wu.json 的 ETag 获取
@@ -9,7 +10,42 @@
  * - bx-v: Baxia SDK 版本号
  */
 
-const crypto = require('crypto');
+// Node.js crypto 模块
+const nodeCrypto = require('crypto');
+
+// 检测运行环境
+const isCloudflareWorker = typeof caches !== 'undefined' && typeof globalThis.WebCryptoPairingIdentity !== 'undefined';
+
+// 加密模块兼容
+const cryptoModule = {
+  randomBytes: (length) => {
+    if (isCloudflareWorker) {
+      const bytes = new Uint8Array(length);
+      crypto.getRandomValues(bytes);
+      return bytes;
+    }
+    return nodeCrypto.randomBytes(length);
+  },
+  createHash: (algo) => {
+    if (isCloudflareWorker) {
+      return {
+        _data: '',
+        update: function(data) {
+          this._data += data;
+          return this;
+        },
+        digest: async function(encoding) {
+          const encoder = new TextEncoder();
+          const data = encoder.encode(this._data);
+          const hashBuffer = await crypto.subtle.digest('MD5', data);
+          const hashArray = new Uint8Array(hashBuffer);
+          return btoa(String.fromCharCode(...hashArray)).substring(0, 32);
+        }
+      };
+    }
+    return nodeCrypto.createHash(algo);
+  }
+};
 
 // Baxia SDK 版本
 const BAXIA_VERSION = '2.5.36';
@@ -25,7 +61,7 @@ const CACHE_TTL = 4 * 60 * 1000; // 4分钟缓存 (略小于5分钟以防过期)
 function randomString(length) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
   let result = '';
-  const randomBytes = crypto.randomBytes(length);
+  const randomBytes = cryptoModule.randomBytes(length);
   for (let i = 0; i < length; i++) {
     result += chars[randomBytes[i] % chars.length];
   }
@@ -46,12 +82,14 @@ function randomDigits(length) {
 /**
  * 生成模拟的 Canvas 指纹
  */
-function generateCanvasFingerprint() {
+async function generateCanvasFingerprint() {
   // Canvas 指纹通常是基于绑定到特定硬件的哈希
-  return crypto.createHash('md5')
-    .update(crypto.randomBytes(32))
-    .digest('base64')
-    .substring(0, 32);
+  const hash = cryptoModule.createHash('md5');
+  hash.update(cryptoModule.randomBytes(32));
+  if (hash.digest instanceof Promise) {
+    return await hash.digest('base64');
+  }
+  return hash.digest('base64').substring(0, 32);
 }
 
 /**
@@ -82,10 +120,12 @@ function generateAudioFingerprint() {
 /**
  * 生成模拟的浏览器特征
  */
-function generateBrowserFeatures() {
+async function generateBrowserFeatures() {
   const platforms = ['Win32', 'Linux x86_64', 'MacIntel'];
   const languages = ['en-US', 'zh-CN', 'en-GB'];
   const timezones = [-480, -300, 0, 60, 480];
+  
+  const canvas = await generateCanvasFingerprint();
   
   return {
     platform: platforms[Math.floor(Math.random() * platforms.length)],
@@ -104,7 +144,7 @@ function generateBrowserFeatures() {
     plugins: randomString(32),
     mimeTypes: randomString(32),
     webGL: generateWebGLFingerprint(),
-    canvas: generateCanvasFingerprint(),
+    canvas: canvas,
     audio: generateAudioFingerprint(),
   };
 }
@@ -124,8 +164,8 @@ function generateTimestampData() {
 /**
  * 收集所有指纹数据并编码
  */
-function collectFingerprintData() {
-  const features = generateBrowserFeatures();
+async function collectFingerprintData() {
+  const features = await generateBrowserFeatures();
   const timestamp = generateTimestampData();
   
   // 组合所有数据
@@ -168,8 +208,15 @@ function encodeBaxiaToken(data) {
   // 将数据转换为紧凑的字符串格式
   const jsonStr = JSON.stringify(data);
   
-  // 使用自定义编码来压缩数据
-  const encoded = Buffer.from(jsonStr).toString('base64');
+  // 使用自定义编码来压缩数据 (兼容各平台)
+  let encoded;
+  if (isCloudflareWorker || typeof Buffer === 'undefined') {
+    // Cloudflare Workers 或浏览器环境
+    encoded = btoa(unescape(encodeURIComponent(jsonStr)));
+  } else {
+    // Node.js 环境
+    encoded = Buffer.from(jsonStr).toString('base64');
+  }
   
   // Baxia token 格式
   return `${BAXIA_VERSION.replace(/\./g, '')}!${encoded}`;
@@ -179,10 +226,10 @@ function encodeBaxiaToken(data) {
  * 生成 bx-ua token
  * @param {boolean} silent - 静默模式
  */
-function generateBxUa(silent = false) {
+async function generateBxUa(silent = false) {
   if (!silent) console.log('[Baxia-Node] Generating bx-ua token...');
   
-  const data = collectFingerprintData();
+  const data = await collectFingerprintData();
   const token = encodeBaxiaToken(data);
   
   if (!silent) console.log('[Baxia-Node] bx-ua length:', token.length);
@@ -198,12 +245,9 @@ function generateBxUa(silent = false) {
 async function generateBxUmidToken(silent = false) {
   if (!silent) console.log('[Baxia-Node] Fetching bx-umidtoken...');
   
-  const https = require('https');
-  
-  return new Promise((resolve, reject) => {
-    const options = {
-      hostname: 'sg-wum.alibaba.com',
-      path: '/w/wu.json',
+  try {
+    // 使用 fetch API (兼容 Node.js 18+ 和 Cloudflare Workers)
+    const response = await fetch('https://sg-wum.alibaba.com/w/wu.json', {
       method: 'GET',
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
@@ -211,40 +255,25 @@ async function generateBxUmidToken(silent = false) {
         'Accept-Language': 'en-US,en;q=0.9',
         'Cache-Control': 'no-cache',
       }
-    };
-    
-    const req = https.request(options, (res) => {
-      const etag = res.headers['etag'];
-      
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        if (etag) {
-          if (!silent) console.log('[Baxia-Node] Got bx-umidtoken from ETag');
-          resolve(etag);
-        } else {
-          if (!silent) console.warn('[Baxia-Node] No ETag in response, generating fallback');
-          resolve('T2gA' + randomString(40));
-        }
-      });
     });
     
-    req.on('error', (e) => {
-      if (!silent) console.error('[Baxia-Node] Error fetching umidtoken:', e.message);
-      resolve('T2gA' + randomString(40));
-    });
+    const etag = response.headers.get('etag');
     
-    req.setTimeout(10000, () => {
-      req.destroy();
-      resolve('T2gA' + randomString(40));
-    });
-    
-    req.end();
-  });
+    if (etag) {
+      if (!silent) console.log('[Baxia-Node] Got bx-umidtoken from ETag');
+      return etag;
+    } else {
+      if (!silent) console.warn('[Baxia-Node] No ETag in response, generating fallback');
+      return 'T2gA' + randomString(40);
+    }
+  } catch (e) {
+    if (!silent) console.error('[Baxia-Node] Error fetching umidtoken:', e.message);
+    return 'T2gA' + randomString(40);
+  }
 }
 
 /**
- * 获取所有 Baxia tokens
+ * 获取所有 Baxia tokens (Node.js 环境)
  * @param {Object} options - 选项
  * @param {boolean} options.silent - 静默模式，不输出日志
  * @param {boolean} options.skipCache - 跳过缓存，强制获取新 token
@@ -262,7 +291,7 @@ async function getBaxiaTokensNode(options = {}) {
   
   if (!silent) console.log('[Baxia-Node] Generating new tokens...');
   
-  const bxUa = generateBxUa(silent);
+  const bxUa = await generateBxUa(silent);
   const bxUmidToken = await generateBxUmidToken(silent);
   const bxV = BAXIA_VERSION;
   
@@ -275,6 +304,17 @@ async function getBaxiaTokensNode(options = {}) {
   if (!silent) console.log('[Baxia-Node] Tokens generated successfully');
   
   return result;
+}
+
+/**
+ * 获取所有 Baxia tokens (通用版本 - 兼容所有平台)
+ * @param {Object} options - 选项
+ * @param {boolean} options.silent - 静默模式，不输出日志
+ * @param {boolean} options.skipCache - 跳过缓存，强制获取新 token
+ * @returns {Promise<{bxUa: string, bxUmidToken: string, bxV: string}>}
+ */
+async function getBaxiaTokensUniversal(options = {}) {
+  return getBaxiaTokensNode(options);
 }
 
 /**
@@ -314,14 +354,15 @@ function clearCache() {
 // 导出
 module.exports = {
   getBaxiaTokensNode,
+  getBaxiaTokensUniversal,
   generateBxUa,
   generateBxUmidToken,
   clearCache,
   BAXIA_VERSION,
 };
 
-// 直接运行
-if (require.main === module) {
+// 直接运行 (仅在 Node.js 环境)
+if (typeof require !== 'undefined' && require.main === module) {
   getBaxiaTokensNode({ skipCache: true })
     .then(tokens => printTokens(tokens))
     .catch(err => console.error('Error:', err.message));
