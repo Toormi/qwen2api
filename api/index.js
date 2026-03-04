@@ -343,14 +343,15 @@ async function buildOssSignedHeaders(uploadUrlWithQuery, tokenData, file) {
   const bucket = hostParts.length > 0 ? hostParts[0] : '';
   const objectPath = parsedUrl.pathname || '/';
   const canonicalUri = bucket ? `/${bucket}${objectPath}` : objectPath;
+  const xOssUserAgent = 'aliyun-sdk-js/6.23.0';
   const canonicalHeaders = [
-    `host:${parsedUrl.host}`,
+    `content-type:${file.mimeType}`,
     'x-oss-content-sha256:UNSIGNED-PAYLOAD',
     `x-oss-date:${xOssDate}`,
     `x-oss-security-token:${tokenData.security_token}`,
+    `x-oss-user-agent:${xOssUserAgent}`,
   ].join('\n') + '\n';
-  const signedHeaders = 'host;x-oss-content-sha256;x-oss-date;x-oss-security-token';
-  const canonicalRequest = ['PUT', canonicalUri, '', canonicalHeaders, signedHeaders, 'UNSIGNED-PAYLOAD'].join('\n');
+  const canonicalRequest = ['PUT', canonicalUri, '', canonicalHeaders, '', 'UNSIGNED-PAYLOAD'].join('\n');
   const credentialScope = `${dateScope}/${region}/oss/aliyun_v4_request`;
   const stringToSign = ['OSS4-HMAC-SHA256', xOssDate, credentialScope, await sha256Hex(canonicalRequest)].join('\n');
 
@@ -367,7 +368,7 @@ async function buildOssSignedHeaders(uploadUrlWithQuery, tokenData, file) {
     'x-oss-content-sha256': 'UNSIGNED-PAYLOAD',
     'x-oss-date': xOssDate,
     'x-oss-security-token': tokenData.security_token,
-    'x-oss-user-agent': 'aliyun-sdk-js/6.23.0',
+    'x-oss-user-agent': xOssUserAgent,
     'Referer': 'https://chat.qwen.ai/',
   };
 }

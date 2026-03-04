@@ -12,6 +12,16 @@ const { handleModels, handleChatCompletions, handleRoot, createResponse, validat
 
 function createExpressStreamHandler(res) {
   return async (response, model, responseId, created) => {
+    const rawFlag = process.env.CHAT_DETAIL_LOG || '';
+    const debugEnabled = ['1', 'true', 'yes', 'on'].includes(String(rawFlag).toLowerCase());
+    let hasStreamContent = false;
+
+    const writeStreamContent = (content) => {
+      if (!debugEnabled || !content) return;
+      hasStreamContent = true;
+      process.stdout.write(content);
+    };
+
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
@@ -39,6 +49,7 @@ function createExpressStreamHandler(res) {
         try {
           const parsed = JSON.parse(data);
           if (parsed.choices?.[0]?.delta?.content) {
+            writeStreamContent(parsed.choices[0].delta.content);
             const chunk = {
               id: responseId, object: 'chat.completion.chunk', created, model,
               choices: [{ index: 0, delta: { content: parsed.choices[0].delta.content }, finish_reason: parsed.choices[0].finish_reason || null }]
@@ -50,6 +61,10 @@ function createExpressStreamHandler(res) {
     }
     res.write('data: [DONE]\n\n');
     res.end();
+    if (debugEnabled && hasStreamContent) {
+      process.stdout.write('\n');
+      console.log('[qwen2api][express][stream] 输出完毕');
+    }
   };
 }
 

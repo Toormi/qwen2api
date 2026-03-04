@@ -832,7 +832,9 @@ async function handleChatCompletions(body, authHeader, env, streamWriter) {
     if (data === '[DONE]') continue;
     try {
       const parsed = JSON.parse(data);
-      if (parsed.choices?.[0]?.delta?.content) chunks.push(parsed.choices[0].delta.content);
+      if (parsed.choices?.[0]?.delta?.content) {
+        chunks.push(parsed.choices[0].delta.content);
+      }
     } catch {}
   }
   logChatDetail('core', 'chat.completion.collected', {
@@ -840,12 +842,17 @@ async function handleChatCompletions(body, authHeader, env, streamWriter) {
     outputLength: chunks.join('').length,
     stream: !!stream,
   });
+  logChatDetail('core', 'stream.content.full', {
+    content: chunks.join(''),
+  });
 
   if (stream) {
+    logChatDetail('core', 'stream.repack.start', { chunkCount: chunks.length });
     const streamBody = chunks.map((c, i) => `data: ${JSON.stringify({
       id: responseId, object: 'chat.completion.chunk', created, model: actualModel,
       choices: [{ index: 0, delta: { content: c }, finish_reason: i === chunks.length - 1 ? 'stop' : null }]
     })}\n\n`).join('') + 'data: [DONE]\n\n';
+    logChatDetail('core', 'stream.repack.done', { responseId });
     return createStreamResponse(streamBody);
   }
 
