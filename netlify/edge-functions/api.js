@@ -1,5 +1,3 @@
-import chatHtml from '../../chat.html';
-
 /**
  * Netlify Edge Functions 入口 - 支持真正的流式输出
  */
@@ -100,7 +98,106 @@ function jsonResponse(body, status = 200, extraHeaders = {}) {
 }
 
 function handleChatPage() {
-  return new Response(chatHtml, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Access-Control-Allow-Origin': '*' } });
+  const html = String.raw`<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Qwen2API Chat</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; background: #f6f7fb; }
+    main { max-width: 920px; margin: 0 auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+    section { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px; }
+    #messages { min-height: 52vh; max-height: 62vh; overflow: auto; }
+    .msg { padding: 8px; border-radius: 8px; white-space: pre-wrap; margin: 8px 0; }
+    .msg-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; font-size: 12px; opacity: 0.8; }
+    .mini { padding: 2px 8px; font-size: 12px; }
+    .u { background: #e8f0ff; }
+    .a { background: #f3f4f6; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    input, select, textarea, button { font: inherit; padding: 8px; border-radius: 8px; border: 1px solid #d1d5db; }
+    textarea { width: 100%; min-height: 90px; }
+    select, input[type=text] { flex: 1; min-width: 180px; }
+    .primary { background: #2563eb; color: #fff; border-color: #2563eb; }
+    .warn { background: #ef4444; color: #fff; border-color: #ef4444; }
+    .status { font-size: 13px; min-height: 20px; }
+    .err { color: #b91c1c; }
+    .ok { color: #047857; }
+    .fi { display: flex; justify-content: space-between; align-items: center; border: 1px solid #e5e7eb; border-radius: 6px; padding: 6px; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <main>
+    <section>
+      <div class="row">
+        <input id="apiKey" type="text" placeholder="API Key（可选）" />
+        <select id="model"><option value="qwen3.5-plus">qwen3.5-plus</option></select>
+        <button id="refreshModels" type="button">刷新模型</button>
+        <button id="clear" class="warn" type="button">清空会话</button>
+      </div>
+    </section>
+    <section id="messages"></section>
+    <section>
+      <textarea id="prompt" placeholder="输入消息；Enter发送，Shift+Enter换行"></textarea>
+      <div class="row">
+        <input id="files" type="file" multiple accept=".pdf,.doc,.docx,.dot,.csv,.xlsx,.xls,.txt,.text,.md,.js,.mjs,.ts,.jsx,.tsx,.vue,.html,.htm,.css,.svg,.svgz,.xml,.json,.jsonc,.wasm,.tex,.latex,.c,.h,.cc,.cxx,.cpp,.hpp,.hh,.hxx,.ino,.java,.kt,.kts,.scala,.groovy,.go,.rs,.swift,.php,.rb,.cs,.vb,.fs,.csproj,.sln,.sql,.lua,.r,.pl,.tcl,.awk,.fish,.yaml,.yml,.toml,.ini,.sh,.bat,.cmd,.dockerfile,.containerfile,.proto,.thrift,.graphql,.gql,.qmd,.smali,.gif,.webp,.jpg,.jpeg,.png,.bmp,.icns,.jp2,.sgi,.tif,.tiff,.mkv,.mov,.wav,.mp3,.m4a,.amr,.aac,image/*,audio/*,video/*" />
+        <button id="send" class="primary" type="button">发送</button>
+        <button id="stop" type="button" disabled>中断</button>
+      </div>
+      <div id="atts"></div>
+      <div id="status" class="status"></div>
+    </section>
+  </main>
+  <script>
+    (function () {
+      var MAX = 5;
+      var MAX_SIZE = 100 * 1024 * 1024;
+      var KEY = 'qwen2api.chat.history.v1';
+      var state = { hist: [], files: [], ac: null };
+      var e = {
+        apiKey: document.getElementById('apiKey'),
+        model: document.getElementById('model'),
+        refreshModels: document.getElementById('refreshModels'),
+        clear: document.getElementById('clear'),
+        messages: document.getElementById('messages'),
+        prompt: document.getElementById('prompt'),
+        files: document.getElementById('files'),
+        atts: document.getElementById('atts'),
+        send: document.getElementById('send'),
+        stop: document.getElementById('stop'),
+        status: document.getElementById('status')
+      };
+      function st(t, k) { e.status.textContent = t || ''; e.status.className = 'status ' + (k || ''); }
+      function msg(role, text, idx) { var d = document.createElement('div'); d.className = 'msg ' + (role === 'assistant' ? 'a' : 'u'); var head = document.createElement('div'); head.className = 'msg-head'; var roleLabel = document.createElement('span'); roleLabel.textContent = role === 'assistant' ? 'Assistant' : 'User'; head.appendChild(roleLabel); if (role === 'user' && typeof idx === 'number') { var retry = document.createElement('button'); retry.type = 'button'; retry.className = 'mini'; retry.textContent = '重发'; retry.onclick = function () { resendFromIndex(idx); }; head.appendChild(retry); } var body = document.createElement('div'); body.textContent = text || ''; d.appendChild(head); d.appendChild(body); e.messages.appendChild(d); e.messages.scrollTop = e.messages.scrollHeight; return body; }
+      function summarizeMessageContent(content) { if (typeof content === 'string') return content; if (!Array.isArray(content)) return ''; var texts = []; var names = []; for (var i = 0; i < content.length; i++) { var part = content[i] || {}; var type = part.type || ''; if (type === 'input_text' && typeof part.input_text === 'string' && part.input_text.trim()) texts.push(part.input_text.trim()); if ((type === 'input_file' || type === 'input_image' || type === 'input_video' || type === 'input_audio') && typeof part.filename === 'string' && part.filename.trim()) names.push(part.filename.trim()); } var base = texts.join('\n'); if (names.length > 0) return (base ? base + '\n' : '') + '[附件] ' + names.join(', '); return base; }
+      function rHist() { e.messages.innerHTML = ''; for (var i = 0; i < state.hist.length; i++) { var x = state.hist[i]; if (!x) continue; var content = x.content; if (typeof content !== 'string' && !Array.isArray(content)) continue; msg(x.role, summarizeMessageContent(content), i); } }
+      function save() { try { var kept = state.hist.filter(function (x) { if (!x) return false; if (typeof x.content === 'string') return !!x.content.trim(); return Array.isArray(x.content) && x.content.length > 0; }).slice(-40); localStorage.setItem(KEY, JSON.stringify(kept)); } catch (_) {} }
+      function load() { try { var v = localStorage.getItem(KEY); if (!v) return; var a = JSON.parse(v); if (Array.isArray(a)) state.hist = a.filter(function (x) { return x && (typeof x.content === 'string' || Array.isArray(x.content)); }); } catch (_) {} }
+      function busy(b) { e.send.disabled = b; e.stop.disabled = !b; e.prompt.disabled = b; e.files.disabled = b; e.clear.disabled = b; e.refreshModels.disabled = b; }
+      function bfmt(n) { if (n < 1024) return n + ' B'; if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB'; return (n / 1024 / 1024).toFixed(1) + ' MB'; }
+      function attRow() { e.atts.innerHTML = ''; for (var i = 0; i < state.files.length; i++) { (function (idx) { var w = document.createElement('div'); w.className = 'fi'; var t = document.createElement('div'); var f = state.files[idx]; t.textContent = f.name + ' (' + bfmt(f.size) + ')'; var rm = document.createElement('button'); rm.type = 'button'; rm.textContent = '移除'; rm.onclick = function () { state.files.splice(idx, 1); attRow(); }; w.appendChild(t); w.appendChild(rm); e.atts.appendChild(w); })(i); } }
+      function toDataUrl(file) { return new Promise(function (ok, bad) { var r = new FileReader(); r.onload = function () { ok(String(r.result || '')); }; r.onerror = function () { bad(new Error('读取文件失败: ' + file.name)); }; r.readAsDataURL(file); }); }
+      function emsg(code, txt) { if (code === 401) return '鉴权失败：Incorrect API key provided.'; if (code === 413) return '请求体过大，请减小附件。'; if (code >= 500) return '服务端异常，请稍后重试。'; return txt ? ('请求失败：' + txt) : ('请求失败（HTTP ' + code + '）'); }
+      async function buildContent(text, files) { var c = []; if (text) c.push({ type: 'input_text', input_text: text }); for (var i = 0; i < files.length; i++) { var f = files[i], d = await toDataUrl(f), m = (f.type || 'application/octet-stream').toLowerCase(); if (m.startsWith('image/')) c.push({ type: 'input_image', image_url: d, filename: f.name, mime_type: m }); else c.push({ type: 'input_file', file_data: d, filename: f.name, mime_type: m }); } return c; }
+      async function loadModels() { var prev = e.model.value; var headers = {}; var key = (e.apiKey.value || '').trim(); if (key) headers.Authorization = 'Bearer ' + key; try { st('正在加载模型列表...', 'ok'); var resp = await fetch('/v1/models', { headers: headers }); if (!resp.ok) { var t = await resp.text().catch(function(){ return ''; }); throw new Error(emsg(resp.status, t)); } var data = await resp.json(); var arr = Array.isArray(data && data.data) ? data.data : []; var ids = arr.map(function (x) { return x && x.id; }).filter(Boolean); if (ids.length === 0) ids = ['qwen3.5-plus']; e.model.innerHTML = ''; for (var i = 0; i < ids.length; i++) { var op = document.createElement('option'); op.value = ids[i]; op.textContent = ids[i]; e.model.appendChild(op); } if (prev && ids.indexOf(prev) >= 0) e.model.value = prev; st('模型列表已更新（' + ids.length + '）', 'ok'); } catch (err) { e.model.innerHTML = '<option value="qwen3.5-plus">qwen3.5-plus</option>'; st(err && err.message ? err.message : '加载模型失败，已回退默认模型。', 'err'); } }
+      function resendFromIndex(idx) { if (state.ac) return; var item = state.hist[idx]; if (!item || item.role !== 'user' || (typeof item.content !== 'string' && !Array.isArray(item.content))) { st('仅支持重发用户消息。', 'err'); return; } e.prompt.value = summarizeMessageContent(item.content); send(item.content, true, idx); }
+      async function send(forceText, fromResend, replayFromIndex) { if (state.ac) return; var text = ''; var filesForSend = fromResend ? [] : state.files; var userMessageContent; if (Array.isArray(forceText)) { userMessageContent = forceText; text = summarizeMessageContent(forceText).trim(); } else { text = (typeof forceText === 'string' ? forceText : (e.prompt.value || '')).trim(); if (!text && filesForSend.length === 0) { st('请输入内容或选择附件。', 'err'); return; } } var model = (e.model.value || '').trim() || 'qwen3.5-plus'; var key = (e.apiKey.value || '').trim(); if (!userMessageContent) { var content; try { st('正在处理附件...', 'ok'); content = await buildContent(text, filesForSend); } catch (err) { st(err && err.message || '附件处理失败', 'err'); return; } userMessageContent = (content.length <= 1 && text) ? text : content; } if (typeof replayFromIndex === 'number' && replayFromIndex >= 0) { state.hist = state.hist.slice(0, replayFromIndex); save(); rHist(); } msg('user', summarizeMessageContent(userMessageContent) || '[附件消息]', state.hist.length); var aEl = msg('assistant', ''); var payload = state.hist.slice(); payload.push({ role: 'user', content: userMessageContent }); state.ac = new AbortController(); busy(true); st('请求中（流式）...', 'ok'); try { var h = { 'Content-Type': 'application/json' }; if (key) h.Authorization = 'Bearer ' + key; var resp = await fetch('/v1/chat/completions', { method: 'POST', headers: h, body: JSON.stringify({ model: model, stream: true, messages: payload }), signal: state.ac.signal }); if (!resp.ok) { var t = await resp.text().catch(function () { return ''; }); throw new Error(emsg(resp.status, t)); } if (!resp.body) throw new Error('浏览器不支持流式响应。'); var r = resp.body.getReader(); var d = new TextDecoder(); var buf = ''; var out = ''; var done = false; while (!done) { var ch = await r.read(); done = ch.done; buf += d.decode(ch.value || new Uint8Array(), { stream: !done }); var lines = buf.split('\n'); buf = lines.pop() || ''; for (var i = 0; i < lines.length; i++) { var ln = lines[i].trim(); if (!ln || ln.indexOf('data:') !== 0) continue; var p = ln.slice(5).trim(); if (!p) continue; if (p === '[DONE]') { done = true; break; } try { var j = JSON.parse(p); var delta = j && j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.content; if (typeof delta === 'string' && delta) { out += delta; aEl.textContent = 'Assistant: ' + out; e.messages.scrollTop = e.messages.scrollHeight; } } catch (_) {} } } if (!out) { out = '(empty response)'; aEl.textContent = 'Assistant: ' + out; } state.hist.push({ role: 'user', content: userMessageContent }); state.hist.push({ role: 'assistant', content: out }); save(); e.prompt.value = ''; state.files = []; attRow(); st('完成。', 'ok'); } catch (err) { if (err && err.name === 'AbortError') st('已中断请求。', 'err'); else { var m = err && err.message || '请求失败'; st(m, 'err'); if (!aEl.textContent) aEl.textContent = 'Assistant: [错误] ' + m; } } finally { state.ac = null; busy(false); } }
+      e.files.onchange = function () { var fs = Array.from(e.files.files || []); for (var i = 0; i < fs.length; i++) { if (state.files.length >= MAX) { st('最多允许 ' + MAX + ' 个附件。', 'err'); break; } var f = fs[i]; if (f.size > MAX_SIZE) { st('文件过大：' + f.name + '（上限 ' + bfmt(MAX_SIZE) + '）', 'err'); continue; } state.files.push(f); } e.files.value = ''; attRow(); if (state.files.length) st('已选择 ' + state.files.length + ' 个附件。', 'ok'); };
+      e.send.onclick = function () { send(); };
+      e.stop.onclick = function () { if (state.ac) state.ac.abort(); };
+      e.clear.onclick = function () { state.hist = []; save(); state.files = []; attRow(); rHist(); st('会话已清空。', 'ok'); };
+      e.refreshModels.onclick = function () { loadModels(); };
+      e.apiKey.addEventListener('blur', function () { loadModels(); });
+      e.prompt.onkeydown = function (ev) { if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); send(); } };
+      load();
+      rHist();
+      loadModels();
+      st('就绪。', 'ok');
+    })();
+  </script>
+</body>
+</html>`;
+  return new Response(html, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Access-Control-Allow-Origin': '*' } });
 }
 
 function logChatDetail(runtime, event, detail = {}) {
