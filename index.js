@@ -4,7 +4,7 @@
  * 支持: Docker (Express) / Vercel / Netlify
  */
 
-const { handleModels, handleChatCompletions, handleRoot, handleChatPage, createResponse, validateToken, uuidv4 } = require('./core.js');
+const { handleModels, handleChatCompletions, handleChatCompletionsWithLogs, handleRoot, handleChatPage, createResponse, validateToken, uuidv4 } = require('./core.js');
 
 // ============================================
 // Express Stream Handler
@@ -109,6 +109,34 @@ function createExpressStreamHandler(res) {
   };
 }
 
+// 带日志流式返回的 Express Handler
+function createExpressLogStreamHandler(res) {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
+  const streamWriter = {
+    write: (data) => {
+      if (!res.writableEnded) {
+        res.write(data);
+      }
+    },
+    log: (logData) => {
+      if (!res.writableEnded) {
+        res.write(`event: log\n`);
+        res.write(`data: ${logData}\n\n`);
+      }
+    },
+    end: () => {
+      if (!res.writableEnded) {
+        res.end();
+      }
+    }
+  };
+
+  return streamWriter;
+}
+
 // ============================================
 // Serverless Handler (Vercel / Netlify)
 // ============================================
@@ -127,6 +155,13 @@ async function serverlessHandler(req, res) {
   
   if (req.method === 'GET' && path.includes('/v1/models')) {
     const result = await handleModels(authHeader);
+    if (res) return res.status(result.statusCode).set(result.headers).send(result.body);
+    return result;
+  }
+  
+  if (req.method === 'POST' && path.includes('/v1/chat/completions/log')) {
+    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    const result = await handleChatCompletionsWithLogs(body, authHeader);
     if (res) return res.status(result.statusCode).set(result.headers).send(result.body);
     return result;
   }
@@ -193,6 +228,10 @@ function startExpressServer() {
     await handleChatCompletions(req.body, req.headers.authorization, null, createExpressStreamHandler(res));
   });
 
+  app.post('/v1/chat/completions/log', authMiddleware, async (req, res) => {
+    await handleChatCompletionsWithLogs(req.body, req.headers.authorization, null, createExpressLogStreamHandler(res));
+  });
+
   app.get('/', (req, res) => {
     const result = handleRoot();
     res.status(200).set(result.headers).send(result.body);
@@ -214,6 +253,7 @@ function startExpressServer() {
 module.exports = serverlessHandler;
 module.exports.handleModels = handleModels;
 module.exports.handleChatCompletions = handleChatCompletions;
+module.exports.handleChatCompletionsWithLogs = handleChatCompletionsWithLogs;
 module.exports.handleRoot = handleRoot;
 module.exports.createResponse = createResponse;
 

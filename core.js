@@ -997,12 +997,252 @@ function handleChatPage() {
 }
 
 // ============================================
+// 带日志流式返回的 Chat Completions
+// ============================================
+
+function createLogStreamWriter(writer) {
+  // writer 是一个对象，包含 write/log/end 方法
+  return async (response, model, responseId, created, logStream) => {
+    const reader = response.body?.getReader ? response.body.getReader() : null;
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let doneWritten = false;
+
+    if (!reader) {
+      throw new Error('Upstream response has no readable body');
+    }
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const trimmed = line.trimStart();
+          if (!trimmed.startsWith('data:')) continue;
+          const data = trimmed.slice(5).trim();
+          if (data === '[DONE]') {
+            writer.write('data: [DONE]\n\n');
+            doneWritten = true;
+            continue;
+          }
+
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed?.error) {
+              const errObj = typeof parsed.error === 'string'
+                ? { error: { message: parsed.error, type: 'api_error' } }
+                : { error: parsed.error };
+              writer.write(`data: ${JSON.stringify(errObj)}\n\n`);
+              continue;
+            }
+
+            const delta = parsed?.choices?.[0]?.delta;
+            if (delta && typeof delta === 'object') {
+              const chunk = {
+                id: responseId,
+                object: 'chat.completion.chunk',
+                created,
+                model,
+                choices: [{
+                  index: 0,
+                  delta: {
+                    ...(typeof delta.role === 'string' ? { role: delta.role } : {}),
+                    ...(typeof delta.content === 'string' ? { content: delta.content } : {}),
+                  },
+                  finish_reason: parsed?.choices?.[0]?.finish_reason || null,
+                }],
+              };
+              writer.write(`data: ${JSON.stringify(chunk)}\n\n`);
+            }
+          } catch {}
+        }
+      }
+    } catch (err) {
+      const message = err && err.message ? err.message : 'stream proxy error';
+      writer.write(`data: ${JSON.stringify({ error: { message } })}\n\n`);
+    } finally {
+      if (!doneWritten) {
+        writer.write('data: [DONE]\n\n');
+      }
+      writer.end();
+    }
+  };
+}
+
+async function handleChatCompletionsWithLogs(body, authHeader, env, streamWriter) {
+  // 验证 token
+  if (!validateToken(authHeader, env)) {
+    return createResponse({ error: { message: 'Incorrect API key provided.', type: 'invalid_request_error' } }, 401);
+  }
+
+  const { model, messages, stream = true } = body;
+  if (!messages?.length) {
+    return createResponse({ error: { message: 'Messages are required' } }, 400);
+  }
+
+  // 日志辅助函数
+  const sendLog = (event, detail = {}) => {
+    const logData = JSON.stringify({ event, timestamp: Date.now(), ...detail });
+    if (streamWriter && streamWriter.log) {
+      streamWriter.log(logData);
+    }
+  };
+
+  sendLog('request.received', { model: model || 'qwen3.5-plus', messageCount: messages.length });
+
+  const actualModel = model || 'qwen3.5-plus';
+  const { bxUa, bxUmidToken, bxV } = await getBaxiaTokens();
+
+  // 检查是否启用搜索
+  const enableSearch = (env?.ENABLE_SEARCH || process?.env?.ENABLE_SEARCH || '').toLowerCase() === 'true';
+  const chatType = enableSearch ? 'search' : 't2t';
+  sendLog('config.ready', { model: actualModel, chatType, enableSearch });
+
+  // 创建会话
+  sendLog('chat.creating', {});
+  const createResp = await fetch(`${QWEN_BASE_URL}/api/v2/chats/new`, {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json', 'Content-Type': 'application/json',
+      'bx-ua': bxUa, 'bx-umidtoken': bxUmidToken, 'bx-v': bxV,
+      'Referer': QWEN_GUEST_REFERER, 'source': 'web',
+      'x-request-id': uuidv4()
+    },
+    body: JSON.stringify({
+      title: '新建对话', models: [actualModel], chat_mode: 'guest', chat_type: chatType,
+      timestamp: Date.now(), project_id: ''
+    })
+  });
+  const createData = await createResp.json();
+  if (!createData.success || !createData.data?.id) {
+    sendLog('chat.create.failed', { status: createResp.status });
+    return createResponse({ error: { message: 'Failed to create chat session' } }, 500);
+  }
+  const chatId = createData.data.id;
+  sendLog('chat.created', { chatId });
+
+  // 解析消息与附件
+  const parsedMessages = parseIncomingMessages(messages);
+  const content = parsedMessages.content;
+  sendLog('message.parsed', { contentLength: content.length, attachmentCount: parsedMessages.attachments.length });
+
+  // 上传附件
+  let uploadedFiles = [];
+  if (parsedMessages.attachments.length > 0) {
+    sendLog('attachments.upload.start', { count: parsedMessages.attachments.length });
+    for (let i = 0; i < parsedMessages.attachments.length; i++) {
+      const rawAttachment = parsedMessages.attachments[i];
+      sendLog('attachment.uploading', { index: i + 1, filename: rawAttachment.filename || 'unknown' });
+      
+      try {
+        const loaded = await getAttachmentBytes(rawAttachment);
+        loaded.explicitType = rawAttachment.explicitType;
+        const { tokenData, filetype } = await requestUploadToken(loaded, { bxUa, bxUmidToken, bxV });
+        await uploadFileToQwenOss(loaded, tokenData);
+        const qwenFilePayload = buildQwenFilePayload(loaded, tokenData, filetype);
+        await ensureUploadStatusForNonVideo(filetype, { bxUa, bxUmidToken, bxV });
+        await parseDocumentIfNeeded(qwenFilePayload, filetype, loaded, { bxUa, bxUmidToken, bxV });
+        if (filetype === 'document') {
+          await ensureUploadStatusForNonVideo(filetype, { bxUa, bxUmidToken, bxV });
+        }
+        uploadedFiles.push(qwenFilePayload);
+        sendLog('attachment.uploaded', { index: i + 1, filetype, filename: loaded.filename });
+      } catch (err) {
+        sendLog('attachment.upload.failed', { index: i + 1, error: err.message });
+      }
+    }
+    sendLog('attachments.upload.done', { uploadedCount: uploadedFiles.length });
+  }
+
+  // 发送请求
+  sendLog('chat.sending', { chatId });
+  const chatResp = await fetch(`${QWEN_BASE_URL}/api/v2/chat/completions?chat_id=${chatId}`, {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json', 'Content-Type': 'application/json',
+      'bx-ua': bxUa, 'bx-umidtoken': bxUmidToken, 'bx-v': bxV,
+      'source': 'web', 'version': '0.2.9', 'Referer': QWEN_GUEST_REFERER, 'x-request-id': uuidv4()
+    },
+    body: JSON.stringify({
+      stream: true, version: '2.1', incremental_output: true,
+      chat_id: chatId, chat_mode: 'guest', model: actualModel, parent_id: null,
+      messages: [{
+        fid: uuidv4(), parentId: null, childrenIds: [uuidv4()], role: 'user', content,
+        user_action: 'chat', files: uploadedFiles, timestamp: Date.now(), models: [actualModel], chat_type: chatType,
+        feature_config: { thinking_enabled: true, output_schema: 'phase', research_mode: 'normal', auto_thinking: true, thinking_format: 'summary', auto_search: enableSearch },
+        extra: { meta: { subChatType: chatType } }, sub_chat_type: chatType, parent_id: null
+      }],
+      timestamp: Date.now()
+    })
+  });
+
+  if (!chatResp.ok) {
+    sendLog('chat.response.failed', { status: chatResp.status });
+    return createResponse({ error: { message: await chatResp.text() } }, chatResp.status);
+  }
+
+  sendLog('chat.streaming', {});
+
+  const responseId = `chatcmpl-${uuidv4()}`;
+  const created = Math.floor(Date.now() / 1000);
+
+  // 如果有流写入器，使用流式处理
+  if (streamWriter && stream) {
+    const logAwareWriter = createLogStreamWriter(streamWriter);
+    return logAwareWriter(chatResp, actualModel, responseId, created);
+  }
+
+  // 非 Express 环境：收集完整响应
+  const reader = chatResp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '', chunks = [];
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+  }
+  for (const line of buffer.split('\n')) {
+    if (!line.startsWith('data: ')) continue;
+    const data = line.slice(6).trim();
+    if (data === '[DONE]') continue;
+    try {
+      const parsed = JSON.parse(data);
+      if (parsed.choices?.[0]?.delta?.content) {
+        chunks.push(parsed.choices[0].delta.content);
+      }
+    } catch {}
+  }
+
+  sendLog('chat.completed', { outputLength: chunks.join('').length });
+
+  if (stream) {
+    const streamBody = chunks.map((c, i) => `data: ${JSON.stringify({
+      id: responseId, object: 'chat.completion.chunk', created, model: actualModel,
+      choices: [{ index: 0, delta: { content: c }, finish_reason: i === chunks.length - 1 ? 'stop' : null }]
+    })}\n\n`).join('') + 'data: [DONE]\n\n';
+    return createStreamResponse(streamBody);
+  }
+
+  return createResponse({
+    id: responseId, object: 'chat.completion', created, model: actualModel,
+    choices: [{ index: 0, message: { role: 'assistant', content: chunks.join('') }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+  });
+}
+
+// ============================================
 // 导出
 // ============================================
 
 module.exports = {
   handleModels,
   handleChatCompletions,
+  handleChatCompletionsWithLogs,
   handleRoot,
   handleChatPage,
   createResponse,

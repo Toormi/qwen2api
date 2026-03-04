@@ -8,7 +8,10 @@
     body { font-family: Arial, sans-serif; margin: 0; background: #f6f7fb; }
     main { max-width: 920px; margin: 0 auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
     section { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px; }
-    #messages { min-height: 52vh; max-height: 62vh; overflow: auto; }
+    .content-row { display: flex; gap: 10px; }
+    .content-row > section { flex: 1; }
+    .chat-area { flex: 1; display: flex; flex-direction: column; }
+    #messages { flex: 1; min-height: 52vh; max-height: 62vh; overflow: auto; }
     .msg { padding: 8px; border-radius: 8px; white-space: pre-wrap; margin: 8px 0; }
     .msg-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; font-size: 12px; opacity: 0.8; }
     .mini { padding: 2px 8px; font-size: 12px; }
@@ -24,6 +27,18 @@
     .err { color: #b91c1c; }
     .ok { color: #047857; }
     .fi { display: flex; justify-content: space-between; align-items: center; border: 1px solid #e5e7eb; border-radius: 6px; padding: 6px; margin-top: 6px; }
+    .log-panel { width: 280px; display: none; }
+    .log-panel.visible { display: flex; flex-direction: column; }
+    #logs { min-height: 52vh; max-height: 62vh; overflow: auto; font-size: 12px; font-family: monospace; background: #1e1e1e; color: #d4d4d4; border-radius: 6px; padding: 8px; }
+    .log-entry { padding: 2px 0; border-bottom: 1px solid #333; }
+    .log-entry:last-child { border-bottom: none; }
+    .log-time { color: #6a9955; margin-right: 8px; }
+    .log-event { color: #569cd6; font-weight: bold; }
+    .log-detail { color: #ce9178; margin-left: 8px; }
+    .log-toggle { background: #6366f1; color: #fff; border-color: #6366f1; }
+    .log-toggle.active { background: #4f46e5; border-color: #4f46e5; }
+    .log-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .log-header span { font-weight: bold; font-size: 14px; }
   </style>
 </head>
 <body>
@@ -33,10 +48,20 @@
         <input id="apiKey" type="text" placeholder="API Key（可选）" />
         <select id="model"><option value="qwen3.5-plus">qwen3.5-plus</option></select>
         <button id="refreshModels" type="button">刷新模型</button>
+        <button id="logToggle" class="log-toggle" type="button">显示日志</button>
         <button id="clear" class="warn" type="button">清空会话</button>
       </div>
     </section>
-    <section id="messages"></section>
+    <div class="content-row">
+      <section id="messages"></section>
+      <section class="log-panel" id="logPanel">
+        <div class="log-header">
+          <span>运行日志</span>
+          <button id="clearLogs" type="button" class="mini">清空日志</button>
+        </div>
+        <div id="logs"></div>
+      </section>
+    </div>
     <section>
       <textarea id="prompt" placeholder="输入消息；Enter发送，Shift+Enter换行"></textarea>
       <div class="row">
@@ -53,12 +78,16 @@
       var MAX = 5;
       var MAX_SIZE = 100 * 1024 * 1024;
       var KEY = 'qwen2api.chat.history.v1';
-      var state = { hist: [], files: [], ac: null };
+      var state = { hist: [], files: [], ac: null, showLogs: false };
       var e = {
         apiKey: document.getElementById('apiKey'),
         model: document.getElementById('model'),
         refreshModels: document.getElementById('refreshModels'),
         clear: document.getElementById('clear'),
+        logToggle: document.getElementById('logToggle'),
+        logPanel: document.getElementById('logPanel'),
+        logs: document.getElementById('logs'),
+        clearLogs: document.getElementById('clearLogs'),
         messages: document.getElementById('messages'),
         prompt: document.getElementById('prompt'),
         files: document.getElementById('files'),
@@ -73,7 +102,7 @@
       function rHist() { e.messages.innerHTML = ''; for (var i = 0; i < state.hist.length; i++) { var x = state.hist[i]; if (!x) continue; var content = x.content; if (typeof content !== 'string' && !Array.isArray(content)) continue; msg(x.role, summarizeMessageContent(content), i); } }
       function save() { try { var kept = state.hist.filter(function (x) { if (!x) return false; if (typeof x.content === 'string') return !!x.content.trim(); return Array.isArray(x.content) && x.content.length > 0; }).slice(-40); localStorage.setItem(KEY, JSON.stringify(kept)); } catch (_) {} }
       function load() { try { var v = localStorage.getItem(KEY); if (!v) return; var a = JSON.parse(v); if (Array.isArray(a)) state.hist = a.filter(function (x) { return x && (typeof x.content === 'string' || Array.isArray(x.content)); }); } catch (_) {} }
-      function busy(b) { e.send.disabled = b; e.stop.disabled = !b; e.prompt.disabled = b; e.files.disabled = b; e.clear.disabled = b; e.refreshModels.disabled = b; }
+      function busy(b) { e.send.disabled = b; e.stop.disabled = !b; e.prompt.disabled = b; e.files.disabled = b; e.clear.disabled = b; e.refreshModels.disabled = b; e.logToggle.disabled = b; }
       function bfmt(n) { if (n < 1024) return n + ' B'; if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB'; return (n / 1024 / 1024).toFixed(1) + ' MB'; }
       function attRow() { e.atts.innerHTML = ''; for (var i = 0; i < state.files.length; i++) { (function (idx) { var w = document.createElement('div'); w.className = 'fi'; var t = document.createElement('div'); var f = state.files[idx]; t.textContent = f.name + ' (' + bfmt(f.size) + ')'; var rm = document.createElement('button'); rm.type = 'button'; rm.textContent = '移除'; rm.onclick = function () { state.files.splice(idx, 1); attRow(); }; w.appendChild(t); w.appendChild(rm); e.atts.appendChild(w); })(i); } }
       function toDataUrl(file) { return new Promise(function (ok, bad) { var r = new FileReader(); r.onload = function () { ok(String(r.result || '')); }; r.onerror = function () { bad(new Error('读取文件失败: ' + file.name)); }; r.readAsDataURL(file); }); }
@@ -81,7 +110,11 @@
       async function buildContent(text, files) { var c = []; if (text) c.push({ type: 'input_text', input_text: text }); for (var i = 0; i < files.length; i++) { var f = files[i], d = await toDataUrl(f), m = (f.type || 'application/octet-stream').toLowerCase(); if (m.startsWith('image/')) c.push({ type: 'input_image', image_url: d, filename: f.name, mime_type: m }); else c.push({ type: 'input_file', file_data: d, filename: f.name, mime_type: m }); } return c; }
       async function loadModels() { var prev = e.model.value; var headers = {}; var key = (e.apiKey.value || '').trim(); if (key) headers.Authorization = 'Bearer ' + key; try { st('正在加载模型列表...', 'ok'); var resp = await fetch('/v1/models', { headers: headers }); if (!resp.ok) { var t = await resp.text().catch(function(){ return ''; }); throw new Error(emsg(resp.status, t)); } var data = await resp.json(); var arr = Array.isArray(data && data.data) ? data.data : []; var ids = arr.map(function (x) { return x && x.id; }).filter(Boolean); if (ids.length === 0) ids = ['qwen3.5-plus']; e.model.innerHTML = ''; for (var i = 0; i < ids.length; i++) { var op = document.createElement('option'); op.value = ids[i]; op.textContent = ids[i]; e.model.appendChild(op); } if (prev && ids.indexOf(prev) >= 0) e.model.value = prev; st('模型列表已更新（' + ids.length + '）', 'ok'); } catch (err) { e.model.innerHTML = '<option value="qwen3.5-plus">qwen3.5-plus</option>'; st(err && err.message ? err.message : '加载模型失败，已回退默认模型。', 'err'); } }
       function resendFromIndex(idx) { if (state.ac) return; var item = state.hist[idx]; if (!item || item.role !== 'user' || (typeof item.content !== 'string' && !Array.isArray(item.content))) { st('仅支持重发用户消息。', 'err'); return; } e.prompt.value = summarizeMessageContent(item.content); send(item.content, true, idx); }
-      async function send(forceText, fromResend, replayFromIndex) { if (state.ac) return; var text = ''; var filesForSend = fromResend ? [] : state.files; var userMessageContent; if (Array.isArray(forceText)) { userMessageContent = forceText; text = summarizeMessageContent(forceText).trim(); } else { text = (typeof forceText === 'string' ? forceText : (e.prompt.value || '')).trim(); if (!text && filesForSend.length === 0) { st('请输入内容或选择附件。', 'err'); return; } } var model = (e.model.value || '').trim() || 'qwen3.5-plus'; var key = (e.apiKey.value || '').trim(); if (!userMessageContent) { var content; try { st('正在处理附件...', 'ok'); content = await buildContent(text, filesForSend); } catch (err) { st(err && err.message || '附件处理失败', 'err'); return; } userMessageContent = (content.length <= 1 && text) ? text : content; } if (typeof replayFromIndex === 'number' && replayFromIndex >= 0) { state.hist = state.hist.slice(0, replayFromIndex); save(); rHist(); } msg('user', summarizeMessageContent(userMessageContent) || '[附件消息]', state.hist.length); var aEl = msg('assistant', ''); var payload = state.hist.slice(); payload.push({ role: 'user', content: userMessageContent }); state.ac = new AbortController(); busy(true); st('请求中（流式）...', 'ok'); try { var h = { 'Content-Type': 'application/json' }; if (key) h.Authorization = 'Bearer ' + key; var resp = await fetch('/v1/chat/completions', { method: 'POST', headers: h, body: JSON.stringify({ model: model, stream: true, messages: payload }), signal: state.ac.signal }); if (!resp.ok) { var t = await resp.text().catch(function () { return ''; }); throw new Error(emsg(resp.status, t)); } if (!resp.body) throw new Error('浏览器不支持流式响应。'); var r = resp.body.getReader(); var d = new TextDecoder(); var buf = ''; var out = ''; var done = false; while (!done) { var ch = await r.read(); done = ch.done; buf += d.decode(ch.value || new Uint8Array(), { stream: !done }); var lines = buf.split('\n'); buf = lines.pop() || ''; for (var i = 0; i < lines.length; i++) { var ln = lines[i].trim(); if (!ln || ln.indexOf('data:') !== 0) continue; var p = ln.slice(5).trim(); if (!p) continue; if (p === '[DONE]') { done = true; break; } try { var j = JSON.parse(p); var delta = j && j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.content; if (typeof delta === 'string' && delta) { out += delta; aEl.textContent = out; e.messages.scrollTop = e.messages.scrollHeight; } } catch (_) {} } } if (!out) { out = '(empty response)'; aEl.textContent = out; } state.hist.push({ role: 'user', content: userMessageContent }); state.hist.push({ role: 'assistant', content: out }); save(); e.prompt.value = ''; state.files = []; attRow(); st('完成。', 'ok'); } catch (err) { if (err && err.name === 'AbortError') st('已中断请求。', 'err'); else { var m = err && err.message || '请求失败'; st(m, 'err'); if (!aEl.textContent) aEl.textContent = '[错误] ' + m; } } finally { state.ac = null; busy(false); } }
+      function formatTime(ts) { var d = new Date(ts); var h = String(d.getHours()).padStart(2, '0'); var m = String(d.getMinutes()).padStart(2, '0'); var s = String(d.getSeconds()).padStart(2, '0'); var ms = String(d.getMilliseconds()).padStart(3, '0'); return h + ':' + m + ':' + s + '.' + ms; }
+      function addLog(logData) { var entry = document.createElement('div'); entry.className = 'log-entry'; var timeSpan = document.createElement('span'); timeSpan.className = 'log-time'; timeSpan.textContent = formatTime(logData.timestamp || Date.now()); var eventSpan = document.createElement('span'); eventSpan.className = 'log-event'; eventSpan.textContent = logData.event || 'unknown'; entry.appendChild(timeSpan); entry.appendChild(eventSpan); var detailStr = ''; var detailKeys = ['model', 'chatId', 'index', 'filename', 'filetype', 'status', 'error', 'messageCount', 'contentLength', 'attachmentCount', 'uploadedCount', 'outputLength', 'chatType', 'enableSearch']; for (var i = 0; i < detailKeys.length; i++) { var k = detailKeys[i]; if (logData[k] !== undefined) { detailStr += (detailStr ? ', ' : '') + k + '=' + logData[k]; } } if (detailStr) { var detailSpan = document.createElement('span'); detailSpan.className = 'log-detail'; detailSpan.textContent = ' ' + detailStr; entry.appendChild(detailSpan); } e.logs.appendChild(entry); e.logs.scrollTop = e.logs.scrollHeight; }
+      async function send(forceText, fromResend, replayFromIndex) { if (state.ac) return; var text = ''; var filesForSend = fromResend ? [] : state.files; var userMessageContent; if (Array.isArray(forceText)) { userMessageContent = forceText; text = summarizeMessageContent(forceText).trim(); } else { text = (typeof forceText === 'string' ? forceText : (e.prompt.value || '')).trim(); if (!text && filesForSend.length === 0) { st('请输入内容或选择附件。', 'err'); return; } } var model = (e.model.value || '').trim() || 'qwen3.5-plus'; var key = (e.apiKey.value || '').trim(); if (!userMessageContent) { var content; try { st('正在处理附件...', 'ok'); content = await buildContent(text, filesForSend); } catch (err) { st(err && err.message || '附件处理失败', 'err'); return; } userMessageContent = (content.length <= 1 && text) ? text : content; } if (typeof replayFromIndex === 'number' && replayFromIndex >= 0) { state.hist = state.hist.slice(0, replayFromIndex); save(); rHist(); } msg('user', summarizeMessageContent(userMessageContent) || '[附件消息]', state.hist.length); var aEl = msg('assistant', ''); var payload = state.hist.slice(); payload.push({ role: 'user', content: userMessageContent }); state.ac = new AbortController(); busy(true); var useLogApi = state.showLogs; st(useLogApi ? '请求中（带日志流式）...' : '请求中（流式）...', 'ok'); try { var h = { 'Content-Type': 'application/json' }; if (key) h.Authorization = 'Bearer ' + key; var endpoint = useLogApi ? '/v1/chat/completions/log' : '/v1/chat/completions'; var resp = await fetch(endpoint, { method: 'POST', headers: h, body: JSON.stringify({ model: model, stream: true, messages: payload }), signal: state.ac.signal }); if (!resp.ok) { var t = await resp.text().catch(function () { return ''; }); throw new Error(emsg(resp.status, t)); } if (!resp.body) throw new Error('浏览器不支持流式响应。'); var r = resp.body.getReader(); var d = new TextDecoder(); var buf = ''; var out = ''; var done = false; while (!done) { var ch = await r.read(); done = ch.done; buf += d.decode(ch.value || new Uint8Array(), { stream: !done }); var lines = buf.split('\n'); buf = lines.pop() || ''; for (var i = 0; i < lines.length; i++) { var ln = lines[i].trim(); if (!ln) continue; if (useLogApi && ln.indexOf('event:') === 0) { var eventType = ln.slice(6).trim(); var nextLine = lines[i + 1] || ''; if (nextLine.indexOf('data:') === 0) { var logData = nextLine.slice(5).trim(); try { addLog(JSON.parse(logData)); } catch (_) {} i++; } continue; } if (ln.indexOf('data:') !== 0) continue; var p = ln.slice(5).trim(); if (!p) continue; if (p === '[DONE]') { done = true; break; } try { var j = JSON.parse(p); var delta = j && j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.content; if (typeof delta === 'string' && delta) { out += delta; aEl.textContent = out; e.messages.scrollTop = e.messages.scrollHeight; } } catch (_) {} } } if (!out) { out = '(empty response)'; aEl.textContent = out; } state.hist.push({ role: 'user', content: userMessageContent }); state.hist.push({ role: 'assistant', content: out }); save(); e.prompt.value = ''; state.files = []; attRow(); st('完成。', 'ok'); } catch (err) { if (err && err.name === 'AbortError') st('已中断请求。', 'err'); else { var m = err && err.message || '请求失败'; st(m, 'err'); if (!aEl.textContent) aEl.textContent = '[错误] ' + m; } } finally { state.ac = null; busy(false); } }
+      e.logToggle.onclick = function () { state.showLogs = !state.showLogs; if (state.showLogs) { e.logPanel.classList.add('visible'); e.logToggle.textContent = '隐藏日志'; e.logToggle.classList.add('active'); } else { e.logPanel.classList.remove('visible'); e.logToggle.textContent = '显示日志'; e.logToggle.classList.remove('active'); } };
+      e.clearLogs.onclick = function () { e.logs.innerHTML = ''; };
       e.files.onchange = function () { var fs = Array.from(e.files.files || []); for (var i = 0; i < fs.length; i++) { if (state.files.length >= MAX) { st('最多允许 ' + MAX + ' 个附件。', 'err'); break; } var f = fs[i]; if (f.size > MAX_SIZE) { st('文件过大：' + f.name + '（上限 ' + bfmt(MAX_SIZE) + '）', 'err'); continue; } state.files.push(f); } e.files.value = ''; attRow(); if (state.files.length) st('已选择 ' + state.files.length + ' 个附件。', 'ok'); };
       e.send.onclick = function () { send(); };
       e.stop.onclick = function () { if (state.ac) state.ac.abort(); };
