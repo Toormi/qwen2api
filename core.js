@@ -1190,14 +1190,37 @@ async function ensureYtDlpAvailable(sendLog) {
   }
 }
 
-async function downloadVideoWithYtDlp(videoUrl, sendLog) {
+function resolveMinVideoResolutionFromInput(rawValue) {
+  const allowed = new Set([360, 480, 720]);
+  if (rawValue === undefined || rawValue === null) return null;
+  const text = String(rawValue).trim().toLowerCase();
+  if (!text || text === 'default') return null;
+  const numeric = Number.parseInt(text, 10);
+  if (!Number.isFinite(numeric)) return null;
+  return allowed.has(numeric) ? numeric : null;
+}
+
+function getEffectiveMinResolution(preferredResolution) {
+  const fromWeb = resolveMinVideoResolutionFromInput(preferredResolution);
+  if (fromWeb) {
+    return { minResolution: fromWeb, source: 'web' };
+  }
+  const fromEnv = resolveMinVideoResolutionFromInput(process.env.MIN_VIDEO_RESOLUTION || '480');
+  if (fromEnv) {
+    return { minResolution: fromEnv, source: 'env' };
+  }
+  return { minResolution: 480, source: 'fallback' };
+}
+
+async function downloadVideoWithYtDlp(videoUrl, sendLog, preferredResolution) {
   const { spawn } = require('child_process');
   const path = require('path');
   const fs = require('fs');
   const os = require('os');
 
   // 从环境变量获取最低分辨率，默认 480p
-  const minResolution = parseInt(process.env.MIN_VIDEO_RESOLUTION || '480', 10);
+  const resolutionInfo = getEffectiveMinResolution(preferredResolution);
+  const minResolution = resolutionInfo.minResolution;
 
   return new Promise((resolve, reject) => {
     const tmpDir = path.join(os.tmpdir(), 'qwen2api_videos');
@@ -1207,12 +1230,18 @@ async function downloadVideoWithYtDlp(videoUrl, sendLog) {
 
     const outputFile = path.join(tmpDir, `video_${Date.now()}.mp4`);
     
-    sendLog('video.download.running', { videoUrl, minResolution: minResolution + 'p' });
+    // 格式选择：优先选不高于目标高度的可用流，避免精确高度导致部分站点误判“格式不可用”
+    // 兜底链：<=目标高度的视频音频分离 -> <=目标高度的单文件 -> 任意可用分离流 -> 任意 best
+    const formatSelector = `bestvideo[height<=${minResolution}][vcodec!=none][acodec=none]+bestaudio[acodec!=none]/best[height<=${minResolution}]/bestvideo[vcodec!=none][acodec=none]+bestaudio[acodec!=none]/best`;
 
-    // 格式选择：最低画质但分辨率不低于指定值
-    // B站等平台 worst 可能不兼容，使用 bestvideo[height<=X] 限制最高分辨率
-    // 先尝试指定分辨率范围，再降级
-    const formatSelector = `bestvideo[height=${minResolution}]+bestaudio/bestvideo[height<=${minResolution}]+bestaudio/best[height<=${minResolution}]/best`;
+    sendLog('video.download.running', {
+      videoUrl,
+      minResolution: minResolution + 'p',
+      minResolutionHint: 'height',
+      resolutionSource: resolutionInfo.source,
+      requestedResolution: preferredResolution === undefined ? null : String(preferredResolution),
+      formatSelector,
+    });
 
     let ytdlpBinary = 'yt-dlp';
     ensureYtDlpAvailable(sendLog).then((resolvedBinary) => {
@@ -1270,13 +1299,15 @@ async function downloadVideoWithYtDlp(videoUrl, sendLog) {
           const base64 = bytes.toString('base64');
           const dataUrl = `data:video/mp4;base64,${base64}`;
           
-          const attachment = {
-            source: dataUrl,
-            filename: path.basename(outputFile),
-            mimeType: 'video/mp4',
-            explicitType: 'video',
-            _tempFilePath: outputFile, // 保留临时文件路径，后续删除
-          };
+        const attachment = {
+          source: dataUrl,
+          filename: path.basename(outputFile),
+          mimeType: 'video/mp4',
+          explicitType: 'video',
+          size: stats.size,
+          sizeMB: sizeMB + ' MB',
+          _tempFilePath: outputFile, // 保留临时文件路径，后续删除
+        };
 
           resolve(attachment);
         } catch (err) {
@@ -1503,20 +1534,35 @@ async function handleChatCompletionsWithLogs(body, authHeader, env, streamWriter
 
   // 处理视频链接下载
   const videoUrl = body.video_url;
+  const preferredResolution = body?.min_video_resolution;
   if (videoUrl) {
-    sendLog('video.download.start', { videoUrl });
+    sendLog('video.download.start', {
+      videoUrl,
+      preferredResolution: preferredResolution === undefined ? null : String(preferredResolution),
+    });
     try {
-      const videoAttachment = await downloadVideoWithYtDlp(videoUrl, sendLog);
+      const videoAttachment = await downloadVideoWithYtDlp(videoUrl, sendLog, preferredResolution);
       if (videoAttachment) {
         parsedMessages.attachments.push(videoAttachment);
         // 记录临时文件路径
         if (videoAttachment._tempFilePath) {
           tempFilesToClean.push(videoAttachment._tempFilePath);
         }
-        sendLog('video.download.completed', { filename: videoAttachment.filename, size: videoAttachment.bytes?.length || 0 });
+        sendLog('video.download.completed', {
+          filename: videoAttachment.filename,
+          size: videoAttachment.size || 0,
+          sizeMB: videoAttachment.sizeMB || '',
+        });
       }
     } catch (err) {
-      sendLog('video.download.failed', { error: err.message });
+      const errorMessage = err && err.message ? err.message : String(err);
+      sendLog('video.download.failed', { error: errorMessage });
+      return createResponse({
+        error: {
+          message: `Video download failed: ${errorMessage}`,
+          type: 'api_error'
+        }
+      }, 500);
     }
   }
 
@@ -1542,7 +1588,14 @@ async function handleChatCompletionsWithLogs(body, authHeader, env, streamWriter
         uploadedFiles.push(qwenFilePayload);
         sendLog('attachment.uploaded', { index: i + 1, filetype, filename: loaded.filename });
       } catch (err) {
-        sendLog('attachment.upload.failed', { index: i + 1, error: err.message });
+        const errorMessage = err && err.message ? err.message : String(err);
+        sendLog('attachment.upload.failed', { index: i + 1, error: errorMessage });
+        return createResponse({
+          error: {
+            message: `Attachment upload failed (index ${i + 1}): ${errorMessage}`,
+            type: 'api_error'
+          }
+        }, 500);
       }
     }
     sendLog('attachments.upload.done', { uploadedCount: uploadedFiles.length });

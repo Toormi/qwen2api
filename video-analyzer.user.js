@@ -17,15 +17,64 @@
   const DEFAULT_PROMPT = '分析视频内容';
   const SERVER_BASE_KEY = 'tm_video_analysis_server_base';
   const MODEL_KEY = 'tm_video_analysis_model';
+  const RESOLUTION_KEY = 'tm_video_analysis_resolution';
   const LAUNCHER_POS_KEY = 'tm_video_analysis_launcher_pos';
   const DEFAULT_MODEL = 'qwen3.5-plus';
+  const DEFAULT_RESOLUTION = 'default';
   const DEFAULT_SERVER_BASE = 'http://localhost:8765';
   const PANEL_ID = 'tm-video-analysis-panel';
   const LAUNCHER_ID = 'tm-video-analysis-launcher';
+  const SCROLLBAR_STYLE_ID = 'tm-video-analysis-scrollbar-style';
   let lastInitUrl = '';
   let routeObserver = null;
   let resizeHookInstalled = false;
   let bootstrapped = false;
+
+  function ensureScrollbarStyles() {
+    if (document.getElementById(SCROLLBAR_STYLE_ID)) {
+      return;
+    }
+
+    const style = create('style', { id: SCROLLBAR_STYLE_ID });
+    style.textContent = `
+#${PANEL_ID} [data-scrollable="true"] {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(107, 114, 128, 0.9) rgba(20, 26, 36, 0.85);
+}
+
+#${PANEL_ID} [data-scrollable="true"]::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+#${PANEL_ID} [data-scrollable="true"]::-webkit-scrollbar-track {
+  background: linear-gradient(180deg, rgba(25, 31, 42, 0.9), rgba(15, 20, 30, 0.92));
+  border-radius: 10px;
+}
+
+#${PANEL_ID} [data-scrollable="true"]::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, rgba(129, 140, 153, 0.95), rgba(107, 114, 128, 0.95));
+  border-radius: 999px;
+  border: 2px solid rgba(18, 22, 30, 0.92);
+  min-height: 28px;
+}
+
+#${PANEL_ID} [data-scrollable="true"]::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, rgba(180, 191, 207, 0.98), rgba(148, 163, 184, 0.98));
+}
+
+#${PANEL_ID} [data-scrollable="true"]::-webkit-scrollbar-thumb:active {
+  background: linear-gradient(180deg, rgba(147, 197, 253, 0.96), rgba(96, 165, 250, 0.96));
+}
+
+#${PANEL_ID} [data-scrollable="true"]::-webkit-scrollbar-corner {
+  background: rgba(15, 20, 30, 0.9);
+}
+`;
+
+    const head = document.head || document.documentElement;
+    head.appendChild(style);
+  }
 
   function create(tag, props = {}) {
     const el = document.createElement(tag);
@@ -100,6 +149,37 @@
 
     const modelRow = create('div');
     modelRow.style.cssText = 'display:flex;gap:8px;align-items:center;margin-bottom:8px;';
+
+    const resolutionRow = create('div');
+    resolutionRow.style.cssText = 'display:flex;gap:8px;align-items:center;margin-bottom:8px;';
+
+    const resolutionLabel = create('div', { textContent: '清晰度' });
+    resolutionLabel.style.cssText = 'width:56px;color:rgba(255,255,255,.82);font-size:12px;';
+
+    const resolutionSelect = create('select');
+    resolutionSelect.style.cssText = [
+      'flex: 1',
+      'box-sizing: border-box',
+      'border: 1px solid #666',
+      'border-radius: 6px',
+      'padding: 8px',
+      'outline: none',
+      'background: #1f1f1f',
+      'color: #fff'
+    ].join(';');
+
+    const storedResolution = localStorage.getItem(RESOLUTION_KEY) || DEFAULT_RESOLUTION;
+    const resolutionOptions = [
+      { value: 'default', label: '默认(按高度p)' },
+      { value: '360', label: '360p' },
+      { value: '480', label: '480p' },
+      { value: '720', label: '720p' }
+    ];
+    for (const item of resolutionOptions) {
+      const option = create('option', { value: item.value, textContent: item.label });
+      option.selected = item.value === storedResolution;
+      resolutionSelect.appendChild(option);
+    }
 
     const modelSelect = create('select');
     modelSelect.style.cssText = [
@@ -176,6 +256,7 @@
     ].join(';');
 
     const statusList = create('div');
+    statusList.dataset.scrollable = 'true';
     statusList.style.cssText = [
     'border: 1px solid #555',
     'border-radius: 6px',
@@ -192,6 +273,7 @@
     outputTitle.style.cssText = 'font-weight:600;margin-bottom:6px;';
 
     const output = create('textarea');
+    output.dataset.scrollable = 'true';
     output.readOnly = true;
     output.placeholder = '这里会显示视频分析结果';
     output.style.cssText = [
@@ -205,6 +287,16 @@
     'background: #111',
     'color: #fff'
     ].join(';');
+
+    const videoSizeInfo = create('div', { textContent: '视频大小: -' });
+    videoSizeInfo.style.cssText = 'margin:6px 0 8px;color:#a7d8ff;font-size:12px;line-height:1.5;';
+    let activeAbortController = null;
+    let lastVideoSizeText = '';
+
+    function setVideoSizeInfo(sizeText) {
+      const text = (sizeText || '').trim();
+      videoSizeInfo.textContent = `视频大小: ${text || '-'}`;
+    }
 
     function appendStatus(text) {
       const line = create('div', { textContent: text });
@@ -220,7 +312,29 @@
     function setLogsExpanded(expanded) {
       logSection.style.display = expanded ? 'block' : 'none';
       toggleLogsButton.textContent = expanded ? '收起日志' : '展开日志';
+      if (!expanded) {
+        statusList.style.height = '180px';
+        return;
+      }
+      const adjust = () => {
+        if (typeof panel.__adjustLogListHeight === 'function') {
+          panel.__adjustLogListHeight();
+        }
+      };
+      requestAnimationFrame(adjust);
     }
+
+    panel.__adjustLogListHeight = () => {
+      if (logSection.style.display === 'none') return;
+      const panelRect = panel.getBoundingClientRect();
+      const listRect = statusList.getBoundingClientRect();
+      const bottomPadding = 12;
+      const minHeight = 96;
+      const maxHeight = 280;
+      const available = Math.floor(panelRect.bottom - listRect.top - bottomPadding);
+      const nextHeight = Math.max(minHeight, Math.min(maxHeight, available));
+      statusList.style.height = `${nextHeight}px`;
+    };
 
     function extractAssistantText(payload) {
       if (!payload || typeof payload !== 'object') {
@@ -285,6 +399,27 @@
 
         if (state.eventType === 'log') {
           appendStatus(`[log] ${payload}`);
+          try {
+            const parsedLog = JSON.parse(payload);
+            if (parsedLog?.event === 'video.download.finished') {
+              const sizeText = parsedLog?.sizeMB || parsedLog?.size || '';
+              const normalizedSize = String(sizeText || '').trim();
+              if (normalizedSize && normalizedSize !== lastVideoSizeText) {
+                appendStatus(`[video] 下载完成，大小: ${sizeText}`);
+                setVideoSizeInfo(normalizedSize);
+                lastVideoSizeText = normalizedSize;
+              }
+            }
+            if (parsedLog?.event === 'video.download.completed') {
+              const sizeText = parsedLog?.sizeMB || parsedLog?.size || '';
+              const normalizedSize = String(sizeText || '').trim();
+              if (normalizedSize && normalizedSize !== lastVideoSizeText) {
+                appendStatus(`[video] 上传前文件大小: ${sizeText}`);
+                setVideoSizeInfo(normalizedSize);
+                lastVideoSizeText = normalizedSize;
+              }
+            }
+          } catch {}
           return;
         }
 
@@ -376,6 +511,10 @@
       localStorage.setItem(MODEL_KEY, modelSelect.value || DEFAULT_MODEL);
     });
 
+    resolutionSelect.addEventListener('change', () => {
+      localStorage.setItem(RESOLUTION_KEY, resolutionSelect.value || DEFAULT_RESOLUTION);
+    });
+
     function setModelOptions(modelIds) {
       const deduped = Array.from(new Set((modelIds || []).filter(Boolean)));
       const current = localStorage.getItem(MODEL_KEY) || DEFAULT_MODEL;
@@ -450,25 +589,33 @@
       const normalizedBase = serverBase.replace(/\/+$/, '');
       const requestUrl = `${normalizedBase}/v1/chat/completions/log`;
       const selectedModel = modelSelect.value || localStorage.getItem(MODEL_KEY) || DEFAULT_MODEL;
+      const selectedResolution = resolutionSelect.value || localStorage.getItem(RESOLUTION_KEY) || DEFAULT_RESOLUTION;
       localStorage.setItem(STORAGE_KEY, userText);
       localStorage.setItem(SERVER_BASE_KEY, serverBase);
       localStorage.setItem(MODEL_KEY, selectedModel);
+      localStorage.setItem(RESOLUTION_KEY, selectedResolution);
 
       clearStatus();
       output.value = '';
+      setVideoSizeInfo('');
+      lastVideoSizeText = '';
 
       appendStatus('准备请求 /v1/chat/completions/log ...');
       appendStatus(`输入内容: ${userText || '(空)'}`);
       appendStatus(`服务地址: ${normalizedBase}`);
       appendStatus(`模型: ${selectedModel}`);
+      appendStatus(`下载清晰度(按高度): ${selectedResolution === 'default' ? '默认(按高度p)' : `${selectedResolution}p`}`);
       appendStatus(`视频链接: ${location.href}`);
 
-      button.disabled = true;
-      button.textContent = '请求中...';
+      const controller = new AbortController();
+      activeAbortController = controller;
+      button.disabled = false;
+      button.textContent = '中断请求';
 
       try {
         const response = await fetch(requestUrl, {
           method: 'POST',
+          signal: controller.signal,
           headers: {
             'Content-Type': 'application/json',
             'Accept': 'text/event-stream'
@@ -482,7 +629,8 @@
                 content: userText || DEFAULT_PROMPT
               }
             ],
-            video_url: location.href
+            video_url: location.href,
+            min_video_resolution: selectedResolution
           })
         });
 
@@ -560,16 +708,28 @@
         output.value = outRef.value || '（空响应）';
         appendStatus('流结束，已输出最终消息');
       } catch (error) {
+        if (error && error.name === 'AbortError') {
+          appendStatus('请求已手动中断');
+          output.value = '请求已中断';
+          return;
+        }
         const msg = error instanceof Error ? error.message : String(error);
         appendStatus(`异常: ${msg}`);
         output.value = `异常: ${msg}`;
       } finally {
+        activeAbortController = null;
         button.disabled = false;
         button.textContent = '开始分析';
       }
     }
 
-    button.addEventListener('click', callVideoAnalysisApi);
+    button.addEventListener('click', () => {
+      if (activeAbortController) {
+        activeAbortController.abort();
+        return;
+      }
+      callVideoAnalysisApi();
+    });
     clearLogsButton.addEventListener('click', () => {
       clearStatus();
       appendStatus('日志已清空');
@@ -583,12 +743,16 @@
     panel.appendChild(title);
     panel.appendChild(input);
     panel.appendChild(serverInput);
+    resolutionRow.appendChild(resolutionLabel);
+    resolutionRow.appendChild(resolutionSelect);
+    panel.appendChild(resolutionRow);
     modelRow.appendChild(modelSelect);
     modelRow.appendChild(reloadModelsButton);
     panel.appendChild(modelRow);
     panel.appendChild(button);
     panel.appendChild(outputTitle);
     panel.appendChild(output);
+    panel.appendChild(videoSizeInfo);
     panel.appendChild(toggleLogsButton);
     statusHeader.appendChild(statusTitle);
     statusHeader.appendChild(clearLogsButton);
@@ -721,6 +885,9 @@
     panel.style.left = `${left}px`;
     panel.style.top = `${top}px`;
     panel.style.right = 'auto';
+    if (typeof panel.__adjustLogListHeight === 'function') {
+      panel.__adjustLogListHeight();
+    }
   }
 
   function setLauncherPosition(launcher, right, top, panel) {
@@ -808,6 +975,8 @@
     if (!document.body) {
       return;
     }
+
+    ensureScrollbarStyles();
 
     if (document.getElementById(PANEL_ID) && document.getElementById(LAUNCHER_ID)) {
       return;
